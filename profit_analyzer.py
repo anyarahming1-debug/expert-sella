@@ -98,7 +98,8 @@ if products:
                 search_term = ' '.join(search_query)
                 search_url = f"https://www.ebay.com/sch/i.html?_nkw={urllib.parse.quote(search_term)}&LH_ItemCondition=3000&LH_Sold=1&LH_Complete=1&rt=nc"
                 
-                  response = requests.get(search_url, headers=headers, timeout=10)
+                response = requests.get(search_url, headers=headers, timeout=10)
+
                 soup = BeautifulSoup(response.content, 'html.parser')
                 
                 # Extract sold prices - updated for current eBay HTML
