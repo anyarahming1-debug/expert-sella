@@ -98,19 +98,35 @@ if products:
                 search_term = ' '.join(search_query)
                 search_url = f"https://www.ebay.com/sch/i.html?_nkw={urllib.parse.quote(search_term)}&LH_ItemCondition=3000&LH_Sold=1&LH_Complete=1&rt=nc"
                 
-                response = requests.get(search_url, headers=headers, timeout=10)
+                  response = requests.get(search_url, headers=headers, timeout=10)
                 soup = BeautifulSoup(response.content, 'html.parser')
                 
-                # Extract sold prices
+                # Extract sold prices - updated for current eBay HTML
                 prices = []
-                for price_elem in soup.find_all('span', {'class': 's-price'}):
-                    try:
-                        price_text = price_elem.get_text().strip()
-                        if price_text.startswith('$'):
-                            price = float(price_text.replace('$', '').replace(',', ''))
-                            prices.append(price)
-                    except:
-                        pass
+                
+                # Try multiple selectors as eBay changes structure frequently
+                price_selectors = [
+                    ('span', {'class': 's-item-price'}),  # Current eBay format
+                    ('span', {'class': 's-price'}),        # Legacy format
+                    ('div', {'class': 's-item-price'}),    # Alternative format
+                ]
+                
+                for tag_name, selector in price_selectors:
+                    for price_elem in soup.find_all(tag_name, selector):
+                        try:
+                            price_text = price_elem.get_text().strip()
+                            # Extract first price value (ignore strikethrough/original prices)
+                            if '$' in price_text:
+                                # Get just the first price mentioned
+                                price_part = price_text.split('$')[1].split()[0]
+                                price = float(price_part.replace(',', ''))
+                                if 0 < price < 500:  # Sanity check: cases shouldn't be >$500
+                                    prices.append(price)
+                        except:
+                            pass
+                    
+                    if prices:  # Stop if we found prices
+                        break
                 
                 if prices:
                     avg_sold = sum(prices) / len(prices)
