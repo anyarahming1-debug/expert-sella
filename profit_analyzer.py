@@ -1,10 +1,10 @@
 import streamlit as st
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
+from requests_html import HTMLSession
 import time
 from io import BytesIO
 import urllib.parse
+import re
 
 st.set_page_config(page_title="Profit Analyzer", layout="wide", initial_sidebar_state="collapsed")
 
@@ -82,14 +82,7 @@ if products:
         with results_container:
             results_table = st.empty()
         
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Accept-Encoding': 'gzip, deflate',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
-        }
+        session = HTMLSession()
         
         for idx, product in enumerate(products):
             product_name = product['product_name']
@@ -98,41 +91,58 @@ if products:
             status_text.markdown(f"<p class='status-processing'>Processing ({idx+1}/{len(products)}): {product_name[:60]}</p>", unsafe_allow_html=True)
             
             try:
-                # Search eBay sold listings
+                # Search eBay sold listings - NEW condition ONLY
                 search_query = product_name.split()[0:3]  # Use first 3 words for search
                 search_term = ' '.join(search_query)
-                search_url = f"https://www.ebay.com/sch/i.html?_nkw={urllib.parse.quote(search_term)}&LH_ItemCondition=3000&LH_Sold=1&LH_Complete=1&rt=nc"
+                # LH_ItemCondition=3000 = New only, sorted by recently sold
+                search_url = f"https://www.ebay.com/sch/i.html?_nkw={urllib.parse.quote(search_term)}&LH_ItemCondition=3000&LH_Sold=1&LH_Complete=1&_sop=10&rt=nc"
                 
-                response = requests.get(search_url, headers=headers, timeout=10)
-
-                soup = BeautifulSoup(response.content, 'html.parser')
+                # Use requests-html to render JavaScript
+                response = session.get(search_url, timeout=15)
+                response.html.render(timeout=10)  # Render JavaScript
+                soup = response.html
                 
-                # Extract sold prices - updated for current eBay HTML
+                # Extract sold prices using CSS selectors (requests-html style)
                 prices = []
                 
-                # Try multiple selectors as eBay changes structure frequently
+                # Try CSS selectors for current eBay structure
                 price_selectors = [
-                    ('span', {'class': 's-item-price'}),  # Current eBay format
-                    ('span', {'class': 's-price'}),        # Legacy format
-                    ('div', {'class': 's-item-price'}),    # Alternative format
+                    'span.s-item-price',
+                    'span.s-price',
+                    'div.s-item-price',
                 ]
                 
-                for tag_name, selector in price_selectors:
-                    for price_elem in soup.find_all(tag_name, selector):
+                for selector in price_selectors:
+                    elems = soup.find(selector)
+                    if elems:
+                        for elem in elems:
+                            try:
+                                price_text = elem.text.strip()
+                                if '$' in price_text:
+                                    # Extract first price value
+                                    price_part = price_text.split('$')[1].split()[0]
+                                    price = float(price_part.replace(',', ''))
+                                    if 5 < price < 500:  # Realistic range
+                                        prices.append(price)
+                            except:
+                                pass
+                    
+                    if prices:
+                        break
+                
+                # If still no prices, try more aggressive search
+                if not prices:
+                    all_text = soup.text
+                    price_matches = re.findall(r'\$(\d+\.?\d*)', all_text)
+                    for price_str in price_matches:
                         try:
-                            price_text = price_elem.get_text().strip()
-                            # Extract first price value (ignore strikethrough/original prices)
-                            if '$' in price_text:
-                                # Get just the first price mentioned
-                                price_part = price_text.split('$')[1].split()[0]
-                                price = float(price_part.replace(',', ''))
-                                if 0 < price < 500:  # Sanity check: cases shouldn't be >$500
-                                    prices.append(price)
+                            price = float(price_str)
+                            if 5 < price < 500:
+                                prices.append(price)
                         except:
                             pass
-                    
-                    if prices:  # Stop if we found prices
-                        break
+                    # Limit to first 50 prices found
+                    prices = prices[:50]
                 
                 if prices:
                     avg_sold = sum(prices) / len(prices)
