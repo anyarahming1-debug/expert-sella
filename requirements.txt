@@ -1,18 +1,6 @@
-streamlit==1.28.1
-pandas==2.0.3
-requests==2.31.0
-beautifulsoup4==4.12.2
-openpyxl==3.1.2
-lxml==4.9.3
-# Replace content of requirements.txt with:
 streamlit>=1.40.0
 pandas>=2.2.0
 requests>=2.32.0
 beautifulsoup4>=4.12.3
 openpyxl>=3.1.5
 html5lib>=1.1
-
-# Then:
-git add requirements.txt
-git commit -m "Update dependencies for Streamlit Cloud compatibility"
-git push origin main
