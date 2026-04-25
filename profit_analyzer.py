@@ -5,7 +5,6 @@ from bs4 import BeautifulSoup
 import time
 from io import BytesIO
 import urllib.parse
-import re
 
 st.set_page_config(page_title="Profit Analyzer", layout="wide", initial_sidebar_state="collapsed")
 
@@ -22,7 +21,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📊 Profit Analyzer")
-st.markdown("*Analyze resale profitability in real-time. Multi-product support, instant insights.*")
+st.markdown("*Analyze resale profitability in real-time.*")
 
 # Sidebar for settings
 with st.sidebar:
@@ -84,7 +83,7 @@ if products:
             results_table = st.empty()
         
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
         for idx, product in enumerate(products):
@@ -94,39 +93,30 @@ if products:
             status_text.markdown(f"<p class='status-processing'>Processing ({idx+1}/{len(products)}): {product_name[:60]}</p>", unsafe_allow_html=True)
             
             try:
-                # Search eBay sold listings
-                search_query = product_name.split()[0:3]
-                search_term = ' '.join(search_query)
-                search_url = f"https://www.ebay.com/sch/i.html?_nkw={urllib.parse.quote(search_term)}&LH_ItemCondition=3000&LH_Sold=1&LH_Complete=1&_sop=10&rt=nc"
+                # Search eBay sold listings - USE FULL PRODUCT NAME
+                search_term = product_name  # Use ENTIRE product name, not just first 3 words
+                search_url = f"https://www.ebay.com/sch/i.html?_nkw={urllib.parse.quote(search_term)}&LH_ItemCondition=3000&LH_Sold=1&LH_Complete=1&rt=nc"
                 
                 response = requests.get(search_url, headers=headers, timeout=10)
                 soup = BeautifulSoup(response.content, 'html.parser')
                 
-                # Extract ALL dollar prices from page
+                # Extract sold prices
                 prices = []
-                all_text = soup.get_text()
-                price_matches = re.findall(r'\$(\d+\.?\d*)', all_text)
-                
-                for price_str in price_matches:
+                for price_elem in soup.find_all('span', {'class': 's-price'}):
                     try:
-                        price = float(price_str)
-                        # Keep prices in realistic range (5-500)
-                        if 5 < price < 500:
-                            prices.append(price)
+                        price_text = price_elem.get_text().strip()
+                        if price_text.startswith('$'):
+                            price = float(price_text.replace('$', '').replace(',', ''))
+                            if 0 < price < 500:
+                                prices.append(price)
                     except:
                         pass
-                
-                # Remove outliers (keep middle 80% of prices)
-                if len(prices) > 5:
-                    prices.sort()
-                    remove_count = len(prices) // 10
-                    prices = prices[remove_count:len(prices)-remove_count]
                 
                 if prices:
                     avg_sold = sum(prices) / len(prices)
                     qty_sold = len(prices)
                 else:
-                    avg_sold = msrp * 0.75
+                    avg_sold = msrp * (resale_percent / 100)
                     qty_sold = 0
                 
                 # Determine shipping
@@ -164,7 +154,7 @@ if products:
                 })
             
             progress_bar.progress((idx + 1) / len(products))
-            time.sleep(1)  # Respectful delay for eBay servers
+            time.sleep(0.5)  # Short delay
         
         # Final results
         st.markdown("---")
@@ -182,7 +172,7 @@ if products:
         with col3:
             st.metric("Items Analyzed", len(results))
         with col4:
-            st.metric("Time Taken", f"~{len(products)}s")
+            st.metric("Time Taken", f"~{len(products)*0.5:.0f}s")
         
         # Download Excel
         st.markdown("---")
