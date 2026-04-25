@@ -101,25 +101,17 @@ if products:
                 response = requests.get(search_url, headers=headers, timeout=10)
                 soup = BeautifulSoup(response.content, 'html.parser')
                 
-                # Extract sold prices from watchcount
+                # Extract "Last sold for $X" prices from watchcount
                 prices = []
+                page_text = soup.get_text()
                 
-                # Try different selectors for watchcount prices
-                # watchcount displays prices in tables/rows
-                for row in soup.find_all('tr'):
+                # Look for pattern: "Last sold for $XX"
+                last_sold_matches = re.findall(r'Last sold for \$(\d+\.?\d*)', page_text)
+                for price_str in last_sold_matches:
                     try:
-                        cells = row.find_all('td')
-                        for cell in cells:
-                            text = cell.get_text().strip()
-                            # Look for price pattern: $XX.XX
-                            if '$' in text and ('.' in text or text.count('$') > 0):
-                                # Extract price
-                                import re
-                                price_match = re.search(r'\$(\d+\.?\d*)', text)
-                                if price_match:
-                                    price = float(price_match.group(1))
-                                    if 0 < price < 500:
-                                        prices.append(price)
+                        price = float(price_str)
+                        if 0 < price < 500:
+                            prices.append(price)
                     except:
                         pass
                 
