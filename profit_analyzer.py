@@ -2,247 +2,475 @@ import streamlit as st
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-import time
 from io import BytesIO
 import urllib.parse
 import re
+import time
+from statistics import median
 
-st.set_page_config(page_title="Profit Analyzer", layout="wide", initial_sidebar_state="collapsed")
+st.set_page_config(page_title="eBay Profit Analyzer", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""
 <style>
-    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
     .main { padding: 20px; }
-    h1 { color: #d32f2f; font-weight: 700; margin-bottom: 10px; }
-    .metric-box { background: #f5f5f5; padding: 15px; border-radius: 8px; margin: 10px 0; }
-    .status-processing { color: #1976d2; font-weight: 600; }
-    .status-success { color: #388e3c; font-weight: 600; }
-    .status-error { color: #d32f2f; font-weight: 600; }
+    h1 { color: #d32f2f; font-weight: 700; }
+    .small-note { color: #666; font-size: 0.9rem; }
 </style>
 """, unsafe_allow_html=True)
 
-st.title("📊 Profit Analyzer")
-st.markdown("*Analyze resale profitability in real-time. Multi-product support, instant insights.*")
+st.title("📊 eBay Profit Analyzer")
+st.markdown(
+    "Paste products as **Product title | buy cost**. "
+    "This version does **not** invent fallback sold prices. If eBay sold comps are not found, it says NO DATA."
+)
 
-# Sidebar for settings
+# -------------------------
+# Helpers
+# -------------------------
+
+def parse_input_lines(text: str):
+    products = []
+    skipped = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "|" not in line:
+            skipped.append(raw_line)
+            continue
+
+        # Split on the LAST pipe only, so titles may contain pipes.
+        title, cost = line.rsplit("|", 1)
+        title = title.strip()
+        cost = cost.strip().replace("$", "").replace(",", "")
+
+        try:
+            cost_float = float(cost)
+        except ValueError:
+            skipped.append(raw_line)
+            continue
+
+        if title:
+            products.append({"product_name": title, "buy_cost": cost_float})
+        else:
+            skipped.append(raw_line)
+
+    return products, skipped
+
+
+def parse_money(text: str):
+    if not text:
+        return None
+
+    cleaned = text.replace(",", "").replace("US $", "$")
+    # eBay sometimes shows "$12.99 to $19.99"; use first visible price.
+    matches = re.findall(r"\$\s*(\d+(?:\.\d{1,2})?)", cleaned)
+    if not matches:
+        return None
+
+    try:
+        return float(matches[0])
+    except ValueError:
+        return None
+
+
+def normalize(text: str):
+    text = text.lower()
+    text = text.replace("’", "'").replace("–", "-").replace("—", "-")
+    text = re.sub(r"[^a-z0-9\s\.\-\/]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def extract_phone_model(text: str):
+    t = normalize(text)
+    # Order matters: pro max before pro before base.
+    patterns = [
+        r"iphone\s*16\s*pro\s*max",
+        r"iphone\s*16\s*pro",
+        r"iphone\s*16\s*plus",
+        r"iphone\s*16\b",
+        r"iphone\s*15\s*pro\s*max",
+        r"iphone\s*15\s*pro",
+        r"iphone\s*15\s*plus",
+        r"iphone\s*15\b",
+        r"iphone\s*14\s*pro\s*max",
+        r"iphone\s*14\s*pro",
+        r"iphone\s*14\s*plus",
+        r"iphone\s*14\b",
+        r"iphone\s*13\s*pro\s*max",
+        r"iphone\s*13\s*pro",
+        r"iphone\s*13\s*mini",
+        r"iphone\s*13\b",
+    ]
+    for pat in patterns:
+        m = re.search(pat, t)
+        if m:
+            return re.sub(r"\s+", " ", m.group(0)).strip()
+    return None
+
+
+def extract_size_tokens(text: str):
+    """Useful mostly for fragrance/skincare/etc."""
+    t = normalize(text)
+    tokens = set()
+
+    # oz / fl oz
+    for m in re.findall(r"(\d+(?:\.\d+)?)\s*(?:fl\s*)?oz", t):
+        tokens.add(f"{float(m):g} oz")
+
+    # ml
+    for m in re.findall(r"(\d+(?:\.\d+)?)\s*ml", t):
+        tokens.add(f"{float(m):g} ml")
+
+    # gb for tablets/electronics
+    for m in re.findall(r"(\d+)\s*gb", t):
+        tokens.add(f"{m} gb")
+
+    # count / ct / pack
+    for m in re.findall(r"(\d+)\s*(?:count|ct|pack|pk)\b", t):
+        tokens.add(f"{m} ct")
+
+    return tokens
+
+
+def brand_tokens(product_name: str):
+    t = normalize(product_name)
+    brands = [
+        "zagg", "otterbox", "uag", "casetify", "incase",
+        "coach", "nike", "adidas", "vans", "crocs",
+        "dior", "christian dior", "yves saint laurent", "ysl",
+        "versace", "paco rabanne", "rabanne", "ralph lauren",
+        "clinique", "estee lauder", "estée lauder", "montblanc",
+        "mugler", "marc jacobs", "prada", "armani", "bose",
+        "jbl", "amazon", "apple", "marshall", "creed",
+        "parfums de marly", "viktor", "flowerbomb", "spicebomb",
+    ]
+    found = []
+    for b in brands:
+        if normalize(b) in t:
+            found.append(normalize(b))
+    return found
+
+
+def clean_search_term(product_name: str):
+    """
+    eBay performs badly with huge Amazon titles.
+    This shortens the query while preserving exact identifiers.
+    """
+    t = product_name
+
+    # Remove retailer noise.
+    t = re.sub(r"\|\s*verizon", "", t, flags=re.I)
+    t = re.sub(r"\bwith notes of\b.*", "", t, flags=re.I)
+    t = re.sub(r"\bfor (women|men|all skin types|home|office|gym)\b.*", "", t, flags=re.I)
+
+    # Phone cases: keep brand + exact model + case name/color.
+    model = extract_phone_model(t)
+    if model:
+        b = brand_tokens(t)
+        first_brand = b[0] if b else ""
+        case_words = []
+        for key in ["santa cruz", "crystal palace", "milan", "denali", "defender", "plasma", "mirror", "halo", "magsafe", "kickstand"]:
+            if key in normalize(t):
+                case_words.append(key)
+        color_match = re.search(r"\b(black|blue|clear|lilac|smoke|gold|green|red|pink|white)\b", t, flags=re.I)
+        color = color_match.group(0) if color_match else ""
+        pieces = [first_brand, " ".join(case_words), model, "case", color]
+        return " ".join([p for p in pieces if p]).strip()
+
+    # Otherwise limit to first meaningful chunk before long marketing copy.
+    t = re.split(r"\s+-\s+|\s+\|\s+", t)[0]
+    words = t.split()
+    return " ".join(words[:12])
+
+
+def title_matches(product_name: str, sold_title: str):
+    """
+    Conservative filter: reject obvious wrong comps.
+    """
+    p = normalize(product_name)
+    s = normalize(sold_title)
+
+    if not s or "shop on ebay" in s:
+        return False
+
+    bad_words_global = [
+        "empty bottle", "empty box", "box only", "for parts", "not working",
+        "broken", "damaged", "read description", "replacement part",
+    ]
+    if any(w in s for w in bad_words_global):
+        return False
+
+    # Phone case mode
+    phone_model = extract_phone_model(p)
+    if phone_model:
+        if phone_model not in s:
+            return False
+        if "case" not in s and "cover" not in s:
+            return False
+
+        # Require brand when product has a known case brand.
+        p_brands = [b for b in brand_tokens(p) if b in ["zagg", "otterbox", "uag", "casetify", "incase"]]
+        if p_brands and not any(b in s for b in p_brands):
+            return False
+
+        reject_case_words = ["screen protector", "glass protector", "lens protector", "camera protector", "skin sticker"]
+        if any(w in s for w in reject_case_words):
+            return False
+
+        return True
+
+    # Fragrance/skincare/product size mode
+    p_sizes = extract_size_tokens(p)
+    s_sizes = extract_size_tokens(s)
+    if p_sizes:
+        # If sold title shows a size, it must overlap. If it shows no size, allow but score later.
+        if s_sizes and not (p_sizes & s_sizes):
+            return False
+
+    # Require at least one brand token if found in product.
+    p_brands = brand_tokens(p)
+    if p_brands and not any(b in s for b in p_brands):
+        return False
+
+    # Token overlap sanity check
+    p_tokens = [w for w in p.split() if len(w) >= 4]
+    important = p_tokens[:8]
+    if important:
+        overlap = sum(1 for w in important if w in s)
+        if overlap < max(1, min(3, len(important)//3)):
+            return False
+
+    return True
+
+
+def score_match(product_name: str, sold_title: str):
+    p = normalize(product_name)
+    s = normalize(sold_title)
+
+    score = 0
+
+    for b in brand_tokens(p):
+        if b in s:
+            score += 5
+
+    phone_model = extract_phone_model(p)
+    if phone_model and phone_model in s:
+        score += 10
+
+    p_sizes = extract_size_tokens(p)
+    s_sizes = extract_size_tokens(s)
+    if p_sizes and s_sizes and (p_sizes & s_sizes):
+        score += 8
+
+    for token in set([w for w in p.split() if len(w) >= 4]):
+        if token in s:
+            score += 1
+
+    return score
+
+
+def fetch_ebay_solds(product_name: str, max_results: int = 30):
+    search_term = clean_search_term(product_name)
+    url = (
+        "https://www.ebay.com/sch/i.html?"
+        f"_nkw={urllib.parse.quote(search_term)}"
+        "&LH_ItemCondition=1000"
+        "&LH_Sold=1&LH_Complete=1"
+        "&LH_BIN=1"
+        "&_sop=13&rt=nc"
+    )
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+
+    soup = BeautifulSoup(r.text, "html.parser")
+
+    comps = []
+    for item in soup.select("li.s-item"):
+        title_el = item.select_one(".s-item__title")
+        price_el = item.select_one(".s-item__price")
+        link_el = item.select_one("a.s-item__link")
+
+        if not title_el or not price_el:
+            continue
+
+        title = title_el.get_text(" ", strip=True)
+        price = parse_money(price_el.get_text(" ", strip=True))
+        link = link_el.get("href") if link_el else ""
+
+        if price is None:
+            continue
+
+        # Keep wide enough range, but eliminate page artifacts.
+        if price < 1 or price > 2000:
+            continue
+
+        if not title_matches(product_name, title):
+            continue
+
+        comps.append({
+            "title": title,
+            "price": price,
+            "score": score_match(product_name, title),
+            "link": link
+        })
+
+    comps = sorted(comps, key=lambda x: x["score"], reverse=True)
+    return comps[:max_results], url, search_term
+
+
+def trimmed_average(values):
+    if not values:
+        return None
+    values = sorted(values)
+    if len(values) >= 8:
+        trim = max(1, int(len(values) * 0.15))
+        values = values[trim:-trim]
+    return sum(values) / len(values)
+
+
+# -------------------------
+# UI
+# -------------------------
+
 with st.sidebar:
     st.header("⚙️ Settings")
-    shipping_shoe = st.slider("Shipping (Shoes) $", 5.00, 15.00, 8.00, 0.50)
-    shipping_slide = st.slider("Shipping (Slides) $", 3.00, 8.00, 5.00, 0.50)
-    resale_percent = st.slider("Resale Price % of MSRP", 50, 100, 75, 5)
-    ebay_fee = st.slider("eBay Fee %", 10.0, 15.0, 12.9, 0.1)
+    default_shipping = st.slider("Default shipping $", 3.00, 15.00, 5.50, 0.50)
+    phone_case_shipping = st.slider("Phone case shipping $", 3.00, 10.00, 4.50, 0.50)
+    fragrance_shipping = st.slider("Fragrance shipping $", 4.00, 12.00, 6.00, 0.50)
+    ebay_fee = st.slider("eBay fee %", 8.0, 16.0, 13.25, 0.05)
+    minimum_profit = st.slider("Minimum profit $", 0.00, 50.00, 4.00, 0.50)
+    delay = st.slider("Delay between searches sec", 0.0, 3.0, 1.0, 0.25)
 
-# Input section
-st.markdown("### 📥 Input Products")
-tab1, tab2 = st.tabs(["Upload CSV", "Paste Titles"])
+st.markdown("### 📥 Paste Products")
+pasted_text = st.text_area(
+    "Format: Product title with size | buy cost",
+    height=260,
+    placeholder="Zagg Santa Cruz Snap Case with MagSafe for iPhone 16 Pro - Blue | 5.5"
+)
 
-products = []
+products, skipped = parse_input_lines(pasted_text) if pasted_text.strip() else ([], [])
 
-with tab1:
-    uploaded_file = st.file_uploader("Upload CSV (columns: product_name, msrp)", type="csv")
-    if uploaded_file:
-        try:
-            df = pd.read_csv(uploaded_file)
-            required_cols = ['product_name', 'msrp']
-            if all(col in df.columns for col in required_cols):
-                products = df.to_dict('records')
-                st.success(f"✓ Loaded {len(products)} products")
-            else:
-                st.error(f"CSV must have columns: {', '.join(required_cols)}")
-        except Exception as e:
-            st.error(f"Error reading CSV: {e}")
-
-with tab2:
-    pasted_text = st.text_area("Paste one product per line (format: Product Name | MSRP)\nExample: Nike Air Max 90 | 120", height=150)
-    if pasted_text.strip():
-        for line in pasted_text.strip().split('\n'):
-            if '|' in line:
-                try:
-                    name, price = line.split('|')
-                    products.append({
-                        'product_name': name.strip(),
-                        'msrp': float(price.strip())
-                    })
-                except:
-                    st.warning(f"Skipped invalid line: {line}")
+if skipped:
+    st.warning(f"Skipped {len(skipped)} invalid lines. Make sure each line is: title | cost")
 
 if products:
-    st.markdown(f"### ✓ Ready to analyze {len(products)} products")
-    
-    if st.button("🚀 Start Analysis", use_container_width=True):
-        st.markdown("---")
-        
+    st.success(f"Ready to analyze {len(products)} products.")
+
+    if st.button("🚀 Start eBay Sold Comp Analysis", use_container_width=True):
         results = []
-        progress_container = st.container()
-        results_container = st.container()
-        
-        with progress_container:
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-        with results_container:
-            results_table = st.empty()
-        
-        session = requests.Session()
-        session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-            'Accept-Language': 'en-US,en;q=0.9',
-        })
-        
+        progress = st.progress(0)
+        status = st.empty()
+        table = st.empty()
+
         for idx, product in enumerate(products):
-            product_name = product['product_name']
-            msrp = product['msrp']
-            
-            status_text.markdown(f"<p class='status-processing'>Processing ({idx+1}/{len(products)}): {product_name[:60]}</p>", unsafe_allow_html=True)
-            
+            name = product["product_name"]
+            cost = product["buy_cost"]
+
+            status.write(f"Analyzing {idx+1}/{len(products)}: {name[:90]}")
+
             try:
-                # Search eBay sold listings - NEW condition ONLY
-                # IMPORTANT: use the full product title. Using only the first 3 words can pull unrelated listings.
-                search_term = product_name.strip()
-                search_url = (
-                    "https://www.ebay.com/sch/i.html?"
-                    f"_nkw={urllib.parse.quote(search_term)}"
-                    "&LH_ItemCondition=1000"      # 1000 = New
-                    "&LH_Sold=1&LH_Complete=1"    # sold + completed
-                    "&LH_BIN=1"                   # Buy It Now only; avoids auction weirdness
-                    "&_sop=13&rt=nc"              # sort by ended recently
-                )
-                
-                response = session.get(search_url, timeout=20)
-                response.raise_for_status()
-                soup = BeautifulSoup(response.text, 'html.parser')
-                
-                def parse_money(text):
-                    """Return the first real dollar price from an eBay price field."""
-                    if not text:
-                        return None
-                    text = text.replace(',', '').replace('US $', '$')
-                    # Ignore percent-off/discount text. We only want dollar amounts from price nodes.
-                    if '%' in text and '$' not in text:
-                        return None
-                    matches = re.findall(r'\$\s*(\d+(?:\.\d{2})?)', text)
-                    if not matches:
-                        return None
-                    # Price ranges like "$20.00 to $35.00": use the first sold price shown.
-                    return float(matches[0])
-                
-                prices = []
-                sold_titles = []
-                
-                # Current eBay result cards use li.s-item and .s-item__price.
-                # Do NOT scrape all page text, because that catches promos like "75% off" and unrelated prices.
-                for item in soup.select('li.s-item'):
-                    title_el = item.select_one('.s-item__title')
-                    price_el = item.select_one('.s-item__price')
-                    if not price_el:
-                        continue
-                    
-                    title_text = title_el.get_text(' ', strip=True) if title_el else ''
-                    if not title_text or title_text.lower() in {'shop on ebay', 'new listing'}:
-                        continue
-                    
-                    price = parse_money(price_el.get_text(' ', strip=True))
-                    if price is None:
-                        continue
-                    
-                    if 5 < price < 500:  # realistic resale range; adjust if needed
-                        prices.append(price)
-                        sold_titles.append(title_text[:80])
-                    
-                    if len(prices) >= 25:
-                        break
-                
+                comps, search_url, search_term = fetch_ebay_solds(name)
+                prices = [c["price"] for c in comps]
+
                 if prices:
-                    avg_sold = sum(prices) / len(prices)
-                    qty_sold = len(prices)
-                    scrape_status = 'eBay sold scrape'
+                    avg_price = trimmed_average(prices)
+                    med_price = median(prices)
+
+                    n = normalize(name)
+                    if extract_phone_model(n):
+                        shipping = phone_case_shipping
+                    elif any(word in n for word in ["eau de", "cologne", "parfum", "perfume", "toilette", "fragrance"]):
+                        shipping = fragrance_shipping
+                    else:
+                        shipping = default_shipping
+
+                    fees = avg_price * (ebay_fee / 100)
+                    net = avg_price - fees - shipping
+                    profit = net - cost
+                    margin = profit / cost * 100 if cost else 0
+
+                    status_label = "✓ BUY" if profit >= minimum_profit else "✗ SKIP"
+
+                    matched = " || ".join([f"${c['price']:.2f} — {c['title'][:95]}" for c in comps[:5]])
+
+                    results.append({
+                        "Product": name,
+                        "Buy Cost": round(cost, 2),
+                        "Search Term": search_term,
+                        "Avg Sold": round(avg_price, 2),
+                        "Median Sold": round(med_price, 2),
+                        "Comps Used": len(prices),
+                        "Shipping": round(shipping, 2),
+                        "eBay Fees": round(fees, 2),
+                        "Net Revenue": round(net, 2),
+                        "Profit": round(profit, 2),
+                        "Margin %": round(margin, 1),
+                        "Status": status_label,
+                        "Matched Sold Titles": matched,
+                        "Search URL": search_url,
+                    })
                 else:
-                    # Keep the fallback, but clearly label it so you don't mistake 75% MSRP for scraped resale.
-                    avg_sold = msrp * (resale_percent / 100)
-                    qty_sold = 0
-                    scrape_status = f'Fallback: {resale_percent}% MSRP - no eBay prices found'
-                
-                # Determine shipping
-                shipping = shipping_shoe
-                if 'slide' in product_name.lower() or 'platform' in product_name.lower():
-                    shipping = shipping_slide
-                
-                # Calculate profit
-                resale_price = avg_sold
-                ebay_fees = resale_price * (ebay_fee / 100)
-                net_revenue = resale_price - ebay_fees - shipping
-                profit = net_revenue - msrp
-                margin = (profit / msrp * 100) if msrp > 0 else 0
-                
-                results.append({
-                    'Product': product_name[:45],
-                    'Avg Sold Price': f"${avg_sold:.2f}",
-                    'Qty Sold (90d)': qty_sold,
-                    'Shipping': f"${shipping:.2f}",
-                    'eBay Fees': f"${ebay_fees:.2f}",
-                    'Net Revenue': f"${net_revenue:.2f}",
-                    'Profit': f"${profit:.2f}",
-                    'Margin %': f"{margin:.1f}%",
-                    'Source': scrape_status,
-                    'Search URL': search_url,
-                    'Status': '✓ Profitable' if profit > 0 else '✗ Loss'
-                })
-                
-                # Update table in real-time
-                if results:
-                    results_table.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
-                
+                    results.append({
+                        "Product": name,
+                        "Buy Cost": round(cost, 2),
+                        "Search Term": search_term,
+                        "Avg Sold": "NO DATA",
+                        "Median Sold": "NO DATA",
+                        "Comps Used": 0,
+                        "Shipping": "",
+                        "eBay Fees": "",
+                        "Net Revenue": "",
+                        "Profit": "NO DATA",
+                        "Margin %": "NO DATA",
+                        "Status": "NO SOLD COMPS",
+                        "Matched Sold Titles": "",
+                        "Search URL": search_url,
+                    })
+
             except Exception as e:
                 results.append({
-                    'Product': product_name[:45],
-                    'Status': f'Error: {str(e)[:25]}'
+                    "Product": name,
+                    "Buy Cost": round(cost, 2),
+                    "Status": f"ERROR: {str(e)[:100]}",
                 })
-            
-            progress_bar.progress((idx + 1) / len(products))
-            time.sleep(1)  # Respectful delay for eBay servers
-        
-        # Final results
-        st.markdown("---")
-        st.markdown("### ✅ Analysis Complete")
-        
-        df_results = pd.DataFrame(results)
-        
-        # Summary stats
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            profitable = sum(1 for r in results if '✓' in r.get('Status', ''))
-            st.metric("Profitable Items", f"{profitable}/{len(products)}")
-        with col2:
-            st.metric("Success Rate", f"{profitable/len(products)*100:.0f}%")
-        with col3:
-            st.metric("Items Analyzed", len(results))
-        with col4:
-            st.metric("Time Taken", f"~{len(products)}s")
-        
-        # Download Excel
-        st.markdown("---")
-        
-        # Create Excel with formatting
+
+            table.dataframe(pd.DataFrame(results), use_container_width=True, hide_index=True)
+            progress.progress((idx + 1) / len(products))
+            time.sleep(delay)
+
+        st.markdown("### ✅ Done")
+
+        df = pd.DataFrame(results)
+
+        if not df.empty and "Status" in df.columns:
+            buy_count = sum(df["Status"].astype(str).str.contains("BUY", na=False))
+            st.metric("BUY items", f"{buy_count}/{len(df)}")
+
         output = BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df_results.to_excel(writer, sheet_name='Results', index=False)
-            
-            worksheet = writer.sheets['Results']
-            for column in worksheet.columns:
-                max_length = max(len(str(cell.value)) for cell in column) + 2
-                worksheet.column_dimensions[column[0].column_letter].width = max_length
-        
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df.to_excel(writer, sheet_name="eBay Profit Results", index=False)
+            ws = writer.sheets["eBay Profit Results"]
+            for col in ws.columns:
+                max_len = min(70, max(len(str(cell.value)) if cell.value is not None else 0 for cell in col) + 2)
+                ws.column_dimensions[col[0].column_letter].width = max_len
+
         output.seek(0)
-        
         st.download_button(
-            label="📥 Download Excel Report",
+            "📥 Download Excel Report",
             data=output,
-            file_name="profit_analysis.xlsx",
+            file_name="ebay_profit_analysis.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
-        
-        st.success("✓ Done! Download your results or run another analysis.")
 
 else:
-    st.info("👆 Upload a CSV or paste product titles to get started")
+    st.info("Paste products above to begin.")
