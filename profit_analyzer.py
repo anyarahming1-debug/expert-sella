@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
-from requests_html import HTMLSession
+import requests
+from bs4 import BeautifulSoup
 import time
 from io import BytesIO
 import urllib.parse
@@ -82,7 +83,9 @@ if products:
         with results_container:
             results_table = st.empty()
         
-        session = HTMLSession()
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
         
         for idx, product in enumerate(products):
             product_name = product['product_name']
@@ -91,64 +94,39 @@ if products:
             status_text.markdown(f"<p class='status-processing'>Processing ({idx+1}/{len(products)}): {product_name[:60]}</p>", unsafe_allow_html=True)
             
             try:
-                # Search eBay sold listings - NEW condition ONLY
-                search_query = product_name.split()[0:3]  # Use first 3 words for search
+                # Search eBay sold listings
+                search_query = product_name.split()[0:3]
                 search_term = ' '.join(search_query)
-                # LH_ItemCondition=3000 = New only, sorted by recently sold
                 search_url = f"https://www.ebay.com/sch/i.html?_nkw={urllib.parse.quote(search_term)}&LH_ItemCondition=3000&LH_Sold=1&LH_Complete=1&_sop=10&rt=nc"
                 
-                # Use requests-html to render JavaScript
-                response = session.get(search_url, timeout=15)
-                response.html.render(timeout=10)  # Render JavaScript
-                soup = response.html
+                response = requests.get(search_url, headers=headers, timeout=10)
+                soup = BeautifulSoup(response.content, 'html.parser')
                 
-                # Extract sold prices using CSS selectors (requests-html style)
+                # Extract ALL dollar prices from page
                 prices = []
+                all_text = soup.get_text()
+                price_matches = re.findall(r'\$(\d+\.?\d*)', all_text)
                 
-                # Try CSS selectors for current eBay structure
-                price_selectors = [
-                    'span.s-item-price',
-                    'span.s-price',
-                    'div.s-item-price',
-                ]
+                for price_str in price_matches:
+                    try:
+                        price = float(price_str)
+                        # Keep prices in realistic range (5-500)
+                        if 5 < price < 500:
+                            prices.append(price)
+                    except:
+                        pass
                 
-                for selector in price_selectors:
-                    elems = soup.find(selector)
-                    if elems:
-                        for elem in elems:
-                            try:
-                                price_text = elem.text.strip()
-                                if '$' in price_text:
-                                    # Extract first price value
-                                    price_part = price_text.split('$')[1].split()[0]
-                                    price = float(price_part.replace(',', ''))
-                                    if 5 < price < 500:  # Realistic range
-                                        prices.append(price)
-                            except:
-                                pass
-                    
-                    if prices:
-                        break
-                
-                # If still no prices, try more aggressive search
-                if not prices:
-                    all_text = soup.text
-                    price_matches = re.findall(r'\$(\d+\.?\d*)', all_text)
-                    for price_str in price_matches:
-                        try:
-                            price = float(price_str)
-                            if 5 < price < 500:
-                                prices.append(price)
-                        except:
-                            pass
-                    # Limit to first 50 prices found
-                    prices = prices[:50]
+                # Remove outliers (keep middle 80% of prices)
+                if len(prices) > 5:
+                    prices.sort()
+                    remove_count = len(prices) // 10
+                    prices = prices[remove_count:len(prices)-remove_count]
                 
                 if prices:
                     avg_sold = sum(prices) / len(prices)
                     qty_sold = len(prices)
                 else:
-                    avg_sold = msrp * (resale_percent / 100)
+                    avg_sold = msrp * 0.75
                     qty_sold = 0
                 
                 # Determine shipping
