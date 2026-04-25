@@ -22,7 +22,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 st.title("📊 Profit Analyzer")
-st.markdown("*Analyze resale profitability in real-time.*")
+st.markdown("*Analyze resale profitability in real-time. Multi-product support, instant insights.*")
 
 # Sidebar for settings
 with st.sidebar:
@@ -83,9 +83,11 @@ if products:
         with results_container:
             results_table = st.empty()
         
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+            'Accept-Language': 'en-US,en;q=0.9',
+        })
         
         for idx, product in enumerate(products):
             product_name = product['product_name']
@@ -94,33 +96,71 @@ if products:
             status_text.markdown(f"<p class='status-processing'>Processing ({idx+1}/{len(products)}): {product_name[:60]}</p>", unsafe_allow_html=True)
             
             try:
-                # Search watchcount.com (eBay analytics) instead of eBay directly
-                search_term = product_name
-                search_url = f"https://www.watchcount.com/ListingsSold.php?q={urllib.parse.quote(search_term)}"
+                # Search eBay sold listings - NEW condition ONLY
+                # IMPORTANT: use the full product title. Using only the first 3 words can pull unrelated listings.
+                search_term = product_name.strip()
+                search_url = (
+                    "https://www.ebay.com/sch/i.html?"
+                    f"_nkw={urllib.parse.quote(search_term)}"
+                    "&LH_ItemCondition=1000"      # 1000 = New
+                    "&LH_Sold=1&LH_Complete=1"    # sold + completed
+                    "&LH_BIN=1"                   # Buy It Now only; avoids auction weirdness
+                    "&_sop=13&rt=nc"              # sort by ended recently
+                )
                 
-                response = requests.get(search_url, headers=headers, timeout=10)
-                soup = BeautifulSoup(response.content, 'html.parser')
+                response = session.get(search_url, timeout=20)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, 'html.parser')
                 
-                # Extract "Last sold for $X" prices from watchcount
+                def parse_money(text):
+                    """Return the first real dollar price from an eBay price field."""
+                    if not text:
+                        return None
+                    text = text.replace(',', '').replace('US $', '$')
+                    # Ignore percent-off/discount text. We only want dollar amounts from price nodes.
+                    if '%' in text and '$' not in text:
+                        return None
+                    matches = re.findall(r'\$\s*(\d+(?:\.\d{2})?)', text)
+                    if not matches:
+                        return None
+                    # Price ranges like "$20.00 to $35.00": use the first sold price shown.
+                    return float(matches[0])
+                
                 prices = []
-                page_text = soup.get_text()
+                sold_titles = []
                 
-                # Look for pattern: "Last sold for $XX"
-                last_sold_matches = re.findall(r'Last sold for \$(\d+\.?\d*)', page_text)
-                for price_str in last_sold_matches:
-                    try:
-                        price = float(price_str)
-                        if 0 < price < 500:
-                            prices.append(price)
-                    except:
-                        pass
+                # Current eBay result cards use li.s-item and .s-item__price.
+                # Do NOT scrape all page text, because that catches promos like "75% off" and unrelated prices.
+                for item in soup.select('li.s-item'):
+                    title_el = item.select_one('.s-item__title')
+                    price_el = item.select_one('.s-item__price')
+                    if not price_el:
+                        continue
+                    
+                    title_text = title_el.get_text(' ', strip=True) if title_el else ''
+                    if not title_text or title_text.lower() in {'shop on ebay', 'new listing'}:
+                        continue
+                    
+                    price = parse_money(price_el.get_text(' ', strip=True))
+                    if price is None:
+                        continue
+                    
+                    if 5 < price < 500:  # realistic resale range; adjust if needed
+                        prices.append(price)
+                        sold_titles.append(title_text[:80])
+                    
+                    if len(prices) >= 25:
+                        break
                 
                 if prices:
                     avg_sold = sum(prices) / len(prices)
                     qty_sold = len(prices)
+                    scrape_status = 'eBay sold scrape'
                 else:
+                    # Keep the fallback, but clearly label it so you don't mistake 75% MSRP for scraped resale.
                     avg_sold = msrp * (resale_percent / 100)
                     qty_sold = 0
+                    scrape_status = f'Fallback: {resale_percent}% MSRP - no eBay prices found'
                 
                 # Determine shipping
                 shipping = shipping_shoe
@@ -143,6 +183,8 @@ if products:
                     'Net Revenue': f"${net_revenue:.2f}",
                     'Profit': f"${profit:.2f}",
                     'Margin %': f"{margin:.1f}%",
+                    'Source': scrape_status,
+                    'Search URL': search_url,
                     'Status': '✓ Profitable' if profit > 0 else '✗ Loss'
                 })
                 
@@ -157,7 +199,7 @@ if products:
                 })
             
             progress_bar.progress((idx + 1) / len(products))
-            time.sleep(0.5)  # Short delay
+            time.sleep(1)  # Respectful delay for eBay servers
         
         # Final results
         st.markdown("---")
@@ -175,7 +217,7 @@ if products:
         with col3:
             st.metric("Items Analyzed", len(results))
         with col4:
-            st.metric("Time Taken", f"~{len(products)*0.5:.0f}s")
+            st.metric("Time Taken", f"~{len(products)}s")
         
         # Download Excel
         st.markdown("---")
