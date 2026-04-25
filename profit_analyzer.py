@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 import time
 from io import BytesIO
 import urllib.parse
+import re
 
 st.set_page_config(page_title="Profit Analyzer", layout="wide", initial_sidebar_state="collapsed")
 
@@ -93,22 +94,32 @@ if products:
             status_text.markdown(f"<p class='status-processing'>Processing ({idx+1}/{len(products)}): {product_name[:60]}</p>", unsafe_allow_html=True)
             
             try:
-                # Search eBay sold listings - USE FULL PRODUCT NAME
-                search_term = product_name  # Use ENTIRE product name, not just first 3 words
-                search_url = f"https://www.ebay.com/sch/i.html?_nkw={urllib.parse.quote(search_term)}&LH_ItemCondition=3000&LH_Sold=1&LH_Complete=1&rt=nc"
+                # Search watchcount.com (eBay analytics) instead of eBay directly
+                search_term = product_name
+                search_url = f"https://www.watchcount.com/ListingsSold.php?q={urllib.parse.quote(search_term)}"
                 
                 response = requests.get(search_url, headers=headers, timeout=10)
                 soup = BeautifulSoup(response.content, 'html.parser')
                 
-                # Extract sold prices
+                # Extract sold prices from watchcount
                 prices = []
-                for price_elem in soup.find_all('span', {'class': 's-price'}):
+                
+                # Try different selectors for watchcount prices
+                # watchcount displays prices in tables/rows
+                for row in soup.find_all('tr'):
                     try:
-                        price_text = price_elem.get_text().strip()
-                        if price_text.startswith('$'):
-                            price = float(price_text.replace('$', '').replace(',', ''))
-                            if 0 < price < 500:
-                                prices.append(price)
+                        cells = row.find_all('td')
+                        for cell in cells:
+                            text = cell.get_text().strip()
+                            # Look for price pattern: $XX.XX
+                            if '$' in text and ('.' in text or text.count('$') > 0):
+                                # Extract price
+                                import re
+                                price_match = re.search(r'\$(\d+\.?\d*)', text)
+                                if price_match:
+                                    price = float(price_match.group(1))
+                                    if 0 < price < 500:
+                                        prices.append(price)
                     except:
                         pass
                 
